@@ -14,6 +14,7 @@ pub struct SchoolConfig {
     pub lga: String,
     pub max_storage_bytes: i64,
     pub used_storage_bytes: i64,
+    pub cloud_server_url: Option<String>,
     pub last_synced_at: Option<String>,
 }
 
@@ -23,6 +24,20 @@ pub struct UpdateSchoolConfigRequest {
     pub state: Option<String>,
     pub lga: Option<String>,
     pub max_storage_bytes: Option<i64>,
+    pub cloud_server_url: Option<String>,
+    pub new_teacher_pin: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyTeacherPinRequest {
+    pub pin: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifyTeacherPinResponse {
+    pub verified: bool,
+    pub school_id: String,
+    pub school_name: String,
 }
 
 // ============================================================================
@@ -42,6 +57,13 @@ pub struct StudentProfile {
     pub completed_lessons: Vec<String>,
     pub quiz_attempts_count: i64,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StudentAuthResponse {
+    #[serde(flatten)]
+    pub profile: StudentProfile,
+    pub session_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,7 +89,7 @@ pub struct ContentPack {
     pub title: String,
     pub subject: String,
     pub grade_level: String,
-    pub curriculum_standard: String, // e.g., "NERDC 9-Year Basic Education", "WAEC/JAMB"
+    pub curriculum_standard: String,
     pub version: String,
     pub description: String,
     pub language: String,
@@ -99,7 +121,7 @@ pub struct LessonItem {
 pub struct QuizItem {
     pub quiz_id: String,
     pub title: String,
-    pub difficulty: String, // "easy", "medium", "hard"
+    pub difficulty: String,
     pub questions: Vec<QuizQuestion>,
 }
 
@@ -110,6 +132,92 @@ pub struct QuizQuestion {
     pub options: Vec<String>,
     pub correct_option_index: usize,
     pub explanation: String,
+}
+
+/// Sanitized student-facing view of a ContentPack that strips `correct_option_index`
+/// and `explanation` so answers cannot be inspected before submitting a quiz.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StudentContentPack {
+    pub pack_id: String,
+    pub title: String,
+    pub subject: String,
+    pub grade_level: String,
+    pub curriculum_standard: String,
+    pub version: String,
+    pub description: String,
+    pub language: String,
+    pub modules: Vec<StudentCurriculumModule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StudentCurriculumModule {
+    pub module_id: String,
+    pub title: String,
+    pub term: String,
+    pub week: u32,
+    pub summary: String,
+    pub lessons: Vec<LessonItem>,
+    pub quizzes: Vec<StudentQuizItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StudentQuizItem {
+    pub quiz_id: String,
+    pub title: String,
+    pub difficulty: String,
+    pub questions: Vec<StudentQuizQuestion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StudentQuizQuestion {
+    pub question_id: String,
+    pub prompt: String,
+    pub options: Vec<String>,
+}
+
+impl ContentPack {
+    pub fn to_student_view(&self) -> StudentContentPack {
+        StudentContentPack {
+            pack_id: self.pack_id.clone(),
+            title: self.title.clone(),
+            subject: self.subject.clone(),
+            grade_level: self.grade_level.clone(),
+            curriculum_standard: self.curriculum_standard.clone(),
+            version: self.version.clone(),
+            description: self.description.clone(),
+            language: self.language.clone(),
+            modules: self
+                .modules
+                .iter()
+                .map(|m| StudentCurriculumModule {
+                    module_id: m.module_id.clone(),
+                    title: m.title.clone(),
+                    term: m.term.clone(),
+                    week: m.week,
+                    summary: m.summary.clone(),
+                    lessons: m.lessons.clone(),
+                    quizzes: m
+                        .quizzes
+                        .iter()
+                        .map(|q| StudentQuizItem {
+                            quiz_id: q.quiz_id.clone(),
+                            title: q.title.clone(),
+                            difficulty: q.difficulty.clone(),
+                            questions: q
+                                .questions
+                                .iter()
+                                .map(|qq| StudentQuizQuestion {
+                                    question_id: qq.question_id.clone(),
+                                    prompt: qq.prompt.clone(),
+                                    options: qq.options.clone(),
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,7 +256,7 @@ pub struct CompleteLessonRequest {
     pub student_id: String,
     pub pack_id: String,
     pub lesson_id: String,
-    pub activity_date: Option<String>, // Optional YYYY-MM-DD override for testing streaks
+    pub activity_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,7 +276,6 @@ pub struct SubmitQuizRequest {
     pub student_id: String,
     pub pack_id: String,
     pub quiz_id: String,
-    /// Selected option index for each question in the quiz, in order
     pub answers: Vec<usize>,
     pub activity_date: Option<String>,
 }
@@ -245,6 +352,7 @@ pub struct CloudSyncResult {
     pub school_state_rank: usize,
     pub synced_students_count: usize,
     pub available_packs: Vec<CloudPackSummary>,
+    pub national_leaderboard: Vec<CloudSchoolLeaderboardEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -23,6 +23,9 @@ pub enum AppError {
     #[error("Insufficient storage: {0}")]
     InsufficientStorage(String),
 
+    #[error("Upstream cloud sync error: {0}")]
+    BadGateway(String),
+
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
@@ -42,6 +45,7 @@ impl IntoResponse for AppError {
                 "INSUFFICIENT_STORAGE",
                 msg.clone(),
             ),
+            AppError::BadGateway(msg) => (StatusCode::BAD_GATEWAY, "BAD_GATEWAY", msg.clone()),
             AppError::Database(err) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "DATABASE_ERROR",

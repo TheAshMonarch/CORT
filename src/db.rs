@@ -1,15 +1,36 @@
+use std::{env, str::FromStr, time::Duration};
+
 use chrono::Utc;
-use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+    Row, SqlitePool,
+};
 
 use crate::{
     error::AppResult,
     models::{ContentPack, CurriculumModule, LessonItem, QuizItem, QuizQuestion},
+    privacy::hash_teacher_pin,
 };
 
+pub const DEFAULT_TEACHER_PIN: &str = "1234";
+
 pub async fn init_db(database_url: &str) -> AppResult<SqlitePool> {
+    let is_in_memory = database_url.contains(":memory:");
+
+    let mut connect_opts = SqliteConnectOptions::from_str(database_url)?
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(5));
+
+    if !is_in_memory {
+        connect_opts = connect_opts
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal);
+    }
+
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
-        .connect(database_url)
+        .max_connections(if is_in_memory { 1 } else { 8 })
+        .connect_with(connect_opts)
         .await?;
 
     run_migrations(&pool).await?;
@@ -28,7 +49,9 @@ async fn run_migrations(pool: &SqlitePool) -> AppResult<()> {
             state TEXT NOT NULL,
             lga TEXT NOT NULL,
             school_salt TEXT NOT NULL,
+            teacher_pin_hash TEXT NOT NULL,
             max_storage_bytes INTEGER NOT NULL,
+            cloud_server_url TEXT,
             last_synced_at TEXT
         );
 
@@ -51,7 +74,8 @@ async fn run_migrations(pool: &SqlitePool) -> AppResult<()> {
             lesson_id TEXT NOT NULL,
             points_awarded INTEGER NOT NULL,
             completed_at TEXT NOT NULL,
-            PRIMARY KEY (student_id, lesson_id)
+            PRIMARY KEY (student_id, lesson_id),
+            FOREIGN KEY (student_id) REFERENCES host_students(student_id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS host_quiz_attempts (
@@ -63,7 +87,8 @@ async fn run_migrations(pool: &SqlitePool) -> AppResult<()> {
             total_questions INTEGER NOT NULL,
             points_awarded INTEGER NOT NULL,
             is_perfect INTEGER NOT NULL,
-            attempted_at TEXT NOT NULL
+            attempted_at TEXT NOT NULL,
+            FOREIGN KEY (student_id) REFERENCES host_students(student_id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS host_packs (
@@ -78,6 +103,16 @@ async fn run_migrations(pool: &SqlitePool) -> AppResult<()> {
             downloaded_at TEXT NOT NULL,
             last_accessed_at TEXT NOT NULL,
             content_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS host_cached_school_leaderboard (
+            school_id TEXT PRIMARY KEY,
+            school_name TEXT NOT NULL,
+            state TEXT NOT NULL,
+            lga TEXT NOT NULL,
+            total_points INTEGER NOT NULL DEFAULT 0,
+            active_students_count INTEGER NOT NULL DEFAULT 0,
+            last_synced_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS cloud_packs (
@@ -131,16 +166,22 @@ async fn seed_defaults(pool: &SqlitePool) -> AppResult<()> {
             .await?;
 
     if school_exists == 0 {
+        let salt = "salt_cort_nigeria_ikeja_2026";
+        let teacher_pin_hash = hash_teacher_pin(DEFAULT_TEACHER_PIN, salt);
+        let env_cloud_url = env::var("CLOUD_SERVER_URL").ok();
+
         sqlx::query(
-            "INSERT INTO host_school_config (id, school_id, school_name, state, lga, school_salt, max_storage_bytes, last_synced_at)
-             VALUES (1, ?, ?, ?, ?, ?, ?, NULL)",
+            "INSERT INTO host_school_config (id, school_id, school_name, state, lga, school_salt, teacher_pin_hash, max_storage_bytes, cloud_server_url, last_synced_at)
+             VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
         )
         .bind("sch_lagos_ikeja_01")
         .bind("Community Junior Secondary School, Ikeja")
         .bind("Lagos")
         .bind("Ikeja")
-        .bind("salt_cort_nigeria_ikeja_2026")
+        .bind(salt)
+        .bind(&teacher_pin_hash)
         .bind(50 * 1024 * 1024_i64) // 50 MB default quota
+        .bind(env_cloud_url)
         .execute(pool)
         .await?;
     }
@@ -197,7 +238,7 @@ async fn seed_defaults(pool: &SqlitePool) -> AppResult<()> {
         }
     }
 
-    // 3. Seed peer schools in the Cloud National Leaderboard for inter-school competition context
+    // 3. Seed peer schools in Cloud & Host Cached National Leaderboard
     let school_lb_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cloud_school_leaderboard")
         .fetch_one(pool)
         .await?;
@@ -234,6 +275,20 @@ async fn seed_defaults(pool: &SqlitePool) -> AppResult<()> {
         for (sid, name, state, lga, pts, count) in peer_schools {
             sqlx::query(
                 "INSERT INTO cloud_school_leaderboard (school_id, school_name, state, lga, total_points, active_students_count, last_synced_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(sid)
+            .bind(name)
+            .bind(state)
+            .bind(lga)
+            .bind(pts)
+            .bind(count)
+            .bind(&now)
+            .execute(pool)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO host_cached_school_leaderboard (school_id, school_name, state, lga, total_points, active_students_count, last_synced_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(sid)

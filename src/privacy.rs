@@ -1,3 +1,4 @@
+use axum::http::HeaderMap;
 use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, AppResult};
@@ -19,6 +20,57 @@ pub fn hash_pin(pin: &str, school_salt: &str) -> String {
     hasher.update(b":pin:");
     hasher.update(pin.as_bytes());
     hex::encode(hasher.finalize())
+}
+
+/// Computes a salted SHA-256 hash of the teacher/operator's admin PIN.
+pub fn hash_teacher_pin(pin: &str, school_salt: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(school_salt.as_bytes());
+    hasher.update(b":teacher_pin:");
+    hasher.update(pin.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Issues a signed session token for an authenticated student on the local Host Device.
+pub fn issue_student_token(student_id: &str, school_salt: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(school_salt.as_bytes());
+    hasher.update(b":student_session:");
+    hasher.update(student_id.as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    format!("{student_id}.{}", &digest[..24])
+}
+
+/// Verifies a student's session token against the expected `student_id`.
+pub fn verify_student_token(
+    token: &str,
+    expected_student_id: &str,
+    school_salt: &str,
+) -> AppResult<()> {
+    let expected = issue_student_token(expected_student_id, school_salt);
+    if token.trim() != expected {
+        return Err(AppError::Unauthorized(
+            "Invalid or expired student session token".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Extracts a Bearer token from the HTTP `Authorization` header if present.
+pub fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")))
+        .map(str::trim)
+}
+
+/// Extracts the Teacher PIN from the `x-teacher-pin` HTTP header if present.
+pub fn extract_teacher_pin(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("x-teacher-pin")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
 }
 
 /// Generates an irreversible, deterministic anonymized student ID for Cloud Sync.
@@ -61,6 +113,14 @@ mod tests {
         let h3 = hash_pin("1234", "salt_b");
         assert_eq!(h1, h2);
         assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn test_student_session_token() {
+        let token = issue_student_token("stu_abc123", "salt_xyz");
+        assert!(verify_student_token(&token, "stu_abc123", "salt_xyz").is_ok());
+        assert!(verify_student_token(&token, "stu_other", "salt_xyz").is_err());
+        assert!(verify_student_token("stu_abc123.forged", "stu_abc123", "salt_xyz").is_err());
     }
 
     #[test]

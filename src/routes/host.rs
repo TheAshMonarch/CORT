@@ -1,6 +1,6 @@
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use chrono::Utc;
@@ -14,18 +14,82 @@ use crate::{
         compute_updated_streak, evaluate_badges, DEFAULT_LESSON_POINTS, PERFECT_QUIZ_BONUS_POINTS,
         POINTS_PER_CORRECT_ANSWER,
     },
+    http_client,
     lru::{ensure_storage_capacity, get_used_storage_bytes},
     models::{
-        AnonymizedStudentSyncRecord, CloudSyncResult, CompleteLessonRequest,
-        CompleteLessonResponse, ContentPack, EvictStorageRequest, EvictStorageResponse,
-        HostPackSummary, LocalLeaderboardEntry, LoginStudentRequest, PullPackRequest,
-        PullPackResponse, QuestionFeedback, RegisterStudentRequest, SchoolConfig, StudentProfile,
-        SubmitQuizRequest, SubmitQuizResponse, SyncUploadPayload, UpdateSchoolConfigRequest,
+        AnonymizedStudentSyncRecord, CloudSchoolLeaderboardEntry, CloudSyncResult,
+        CompleteLessonRequest, CompleteLessonResponse, ContentPack, EvictStorageRequest,
+        EvictStorageResponse, HostPackSummary, LocalLeaderboardEntry, LoginStudentRequest,
+        PullPackRequest, PullPackResponse, QuestionFeedback, RegisterStudentRequest, SchoolConfig,
+        StudentAuthResponse, StudentContentPack, StudentProfile, SubmitQuizRequest,
+        SubmitQuizResponse, SyncUploadPayload, UpdateSchoolConfigRequest, VerifyTeacherPinRequest,
+        VerifyTeacherPinResponse,
     },
-    privacy::{anonymize_student_id, anonymized_display_moniker, hash_pin, validate_pin_format},
-    routes::cloud::process_cloud_sync_payload,
+    privacy::{
+        anonymize_student_id, anonymized_display_moniker, extract_bearer_token,
+        extract_teacher_pin, hash_pin, hash_teacher_pin, issue_student_token, validate_pin_format,
+        verify_student_token,
+    },
+    routes::cloud::{process_cloud_sync_payload, LeaderboardFilter},
     AppState,
 };
+
+// ============================================================================
+// Teacher & Student Auth Guards
+// ============================================================================
+
+async fn require_teacher_pin(pool: &SqlitePool, headers: &HeaderMap) -> AppResult<()> {
+    let provided_pin = extract_teacher_pin(headers).ok_or_else(|| {
+        AppError::Unauthorized(
+            "Missing 'X-Teacher-Pin' header for teacher-protected operation".to_string(),
+        )
+    })?;
+
+    verify_teacher_pin_in_db(pool, provided_pin).await
+}
+
+async fn verify_teacher_pin_in_db(pool: &SqlitePool, provided_pin: &str) -> AppResult<()> {
+    let row = sqlx::query("SELECT school_salt, teacher_pin_hash FROM host_school_config WHERE id = 1")
+        .fetch_one(pool)
+        .await?;
+
+    let salt: String = row.try_get("school_salt")?;
+    let expected_hash: String = row.try_get("teacher_pin_hash")?;
+    let actual_hash = hash_teacher_pin(provided_pin.trim(), &salt);
+
+    if actual_hash != expected_hash {
+        return Err(AppError::Unauthorized("Invalid Teacher PIN".to_string()));
+    }
+
+    Ok(())
+}
+
+async fn require_student_session(
+    pool: &SqlitePool,
+    headers: &HeaderMap,
+    expected_student_id: &str,
+) -> AppResult<()> {
+    let token = extract_bearer_token(headers).ok_or_else(|| {
+        AppError::Unauthorized(
+            "Missing 'Authorization: Bearer <session_token>' header".to_string(),
+        )
+    })?;
+    let salt = get_school_salt(pool).await?;
+    verify_student_token(token, expected_student_id, &salt)
+}
+
+pub async fn verify_teacher_pin_handler(
+    State(state): State<AppState>,
+    Json(req): Json<VerifyTeacherPinRequest>,
+) -> AppResult<Json<VerifyTeacherPinResponse>> {
+    verify_teacher_pin_in_db(&state.pool, &req.pin).await?;
+    let config = fetch_school_config(&state.pool).await?;
+    Ok(Json(VerifyTeacherPinResponse {
+        verified: true,
+        school_id: config.school_id,
+        school_name: config.school_name,
+    }))
+}
 
 // ============================================================================
 // School Config Endpoints
@@ -38,7 +102,7 @@ pub async fn get_school_config(State(state): State<AppState>) -> AppResult<Json<
 
 pub async fn fetch_school_config(pool: &SqlitePool) -> AppResult<SchoolConfig> {
     let row = sqlx::query(
-        "SELECT school_id, school_name, state, lga, max_storage_bytes, last_synced_at
+        "SELECT school_id, school_name, state, lga, max_storage_bytes, cloud_server_url, last_synced_at
          FROM host_school_config WHERE id = 1",
     )
     .fetch_one(pool)
@@ -53,20 +117,29 @@ pub async fn fetch_school_config(pool: &SqlitePool) -> AppResult<SchoolConfig> {
         lga: row.try_get("lga")?,
         max_storage_bytes: row.try_get("max_storage_bytes")?,
         used_storage_bytes,
+        cloud_server_url: row.try_get("cloud_server_url")?,
         last_synced_at: row.try_get("last_synced_at")?,
     })
 }
 
 pub async fn update_school_config(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<UpdateSchoolConfigRequest>,
 ) -> AppResult<Json<SchoolConfig>> {
+    require_teacher_pin(&state.pool, &headers).await?;
+
     let current = fetch_school_config(&state.pool).await?;
 
     let school_name = req.school_name.unwrap_or(current.school_name);
     let state_name = req.state.unwrap_or(current.state);
     let lga = req.lga.unwrap_or(current.lga);
     let max_storage_bytes = req.max_storage_bytes.unwrap_or(current.max_storage_bytes);
+    let cloud_server_url = match req.cloud_server_url {
+        Some(url) if url.trim().is_empty() => None,
+        Some(url) => Some(url.trim().to_string()),
+        None => current.cloud_server_url,
+    };
 
     if max_storage_bytes <= 0 {
         return Err(AppError::BadRequest(
@@ -74,15 +147,26 @@ pub async fn update_school_config(
         ));
     }
 
+    if let Some(ref new_pin) = req.new_teacher_pin {
+        validate_pin_format(new_pin)?;
+        let salt = get_school_salt(&state.pool).await?;
+        let new_hash = hash_teacher_pin(new_pin, &salt);
+        sqlx::query("UPDATE host_school_config SET teacher_pin_hash = ? WHERE id = 1")
+            .bind(&new_hash)
+            .execute(&state.pool)
+            .await?;
+    }
+
     sqlx::query(
         "UPDATE host_school_config
-         SET school_name = ?, state = ?, lga = ?, max_storage_bytes = ?
+         SET school_name = ?, state = ?, lga = ?, max_storage_bytes = ?, cloud_server_url = ?
          WHERE id = 1",
     )
     .bind(&school_name)
     .bind(&state_name)
     .bind(&lga)
     .bind(max_storage_bytes)
+    .bind(&cloud_server_url)
     .execute(&state.pool)
     .await?;
 
@@ -97,7 +181,7 @@ pub async fn update_school_config(
 pub async fn register_student(
     State(state): State<AppState>,
     Json(req): Json<RegisterStudentRequest>,
-) -> AppResult<(StatusCode, Json<StudentProfile>)> {
+) -> AppResult<(StatusCode, Json<StudentAuthResponse>)> {
     let nickname = req.nickname.trim().to_string();
     if nickname.len() < 2 || nickname.len() > 40 {
         return Err(AppError::BadRequest(
@@ -118,9 +202,10 @@ pub async fn register_student(
         )));
     }
 
+    let salt = get_school_salt(&state.pool).await?;
+
     let pin_hash = if let Some(ref pin) = req.pin {
         validate_pin_format(pin)?;
-        let salt = get_school_salt(&state.pool).await?;
         Some(hash_pin(pin, &salt))
     } else {
         None
@@ -147,13 +232,21 @@ pub async fn register_student(
     .await?;
 
     let profile = fetch_student_profile(&state.pool, &student_id).await?;
-    Ok((StatusCode::CREATED, Json(profile)))
+    let session_token = issue_student_token(&student_id, &salt);
+
+    Ok((
+        StatusCode::CREATED,
+        Json(StudentAuthResponse {
+            profile,
+            session_token,
+        }),
+    ))
 }
 
 pub async fn login_student(
     State(state): State<AppState>,
     Json(req): Json<LoginStudentRequest>,
-) -> AppResult<Json<StudentProfile>> {
+) -> AppResult<Json<StudentAuthResponse>> {
     let row = sqlx::query(
         "SELECT student_id, pin_hash FROM host_students WHERE LOWER(nickname) = LOWER(?)",
     )
@@ -164,12 +257,12 @@ pub async fn login_student(
 
     let student_id: String = row.try_get("student_id")?;
     let stored_pin_hash: Option<String> = row.try_get("pin_hash")?;
+    let salt = get_school_salt(&state.pool).await?;
 
     if let Some(expected_hash) = stored_pin_hash {
         let provided_pin = req.pin.as_deref().ok_or_else(|| {
             AppError::Unauthorized("PIN is required for this student profile".to_string())
         })?;
-        let salt = get_school_salt(&state.pool).await?;
         let actual_hash = hash_pin(provided_pin, &salt);
         if actual_hash != expected_hash {
             return Err(AppError::Unauthorized("Invalid PIN".to_string()));
@@ -177,7 +270,12 @@ pub async fn login_student(
     }
 
     let profile = fetch_student_profile(&state.pool, &student_id).await?;
-    Ok(Json(profile))
+    let session_token = issue_student_token(&student_id, &salt);
+
+    Ok(Json(StudentAuthResponse {
+        profile,
+        session_token,
+    }))
 }
 
 pub async fn get_student_profile(
@@ -272,12 +370,13 @@ pub async fn list_host_packs(
     Ok(Json(packs))
 }
 
-/// Fetches a cached content pack on the Host Device and updates its `last_accessed_at` timestamp
-/// so active packs are retained by the LRU cache.
+/// Fetches a sanitized student-facing view of a cached content pack on the Host Device
+/// (stripping `correct_option_index` and `explanation` so quiz answers are not leaked)
+/// and updates its `last_accessed_at` timestamp for the LRU cache.
 pub async fn get_host_pack(
     State(state): State<AppState>,
     Path(pack_id): Path<String>,
-) -> AppResult<Json<ContentPack>> {
+) -> AppResult<Json<StudentContentPack>> {
     let row = sqlx::query("SELECT content_json FROM host_packs WHERE pack_id = ?")
         .bind(&pack_id)
         .fetch_optional(&state.pool)
@@ -297,15 +396,18 @@ pub async fn get_host_pack(
 
     let content_json: String = row.try_get("content_json")?;
     let pack: ContentPack = serde_json::from_str(&content_json)?;
-    Ok(Json(pack))
+    Ok(Json(pack.to_student_view()))
 }
 
 /// Manually triggers LRU cache eviction to bring Host Device storage usage within `target_max_bytes`
-/// (or the school's configured `max_storage_bytes`).
+/// (or the school's configured `max_storage_bytes`). Requires `X-Teacher-Pin`.
 pub async fn evict_host_packs(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<EvictStorageRequest>,
 ) -> AppResult<Json<EvictStorageResponse>> {
+    require_teacher_pin(&state.pool, &headers).await?;
+
     let config = fetch_school_config(&state.pool).await?;
     let target_budget = req.target_max_bytes.unwrap_or(config.max_storage_bytes);
 
@@ -331,12 +433,16 @@ pub async fn evict_host_packs(
 
 pub async fn complete_lesson(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CompleteLessonRequest>,
 ) -> AppResult<Json<CompleteLessonResponse>> {
-    // 1. Verify student exists
+    // 1. Verify student session token matches student_id
+    require_student_session(&state.pool, &headers, &req.student_id).await?;
+
+    // 2. Verify student exists
     let student = fetch_student_profile(&state.pool, &req.student_id).await?;
 
-    // 2. Verify pack & lesson exist on the Host Device and touch LRU timestamp
+    // 3. Verify pack & lesson exist on the Host Device and touch LRU timestamp
     let pack_row = sqlx::query("SELECT content_json FROM host_packs WHERE pack_id = ?")
         .bind(&req.pack_id)
         .fetch_optional(&state.pool)
@@ -370,7 +476,7 @@ pub async fn complete_lesson(
         .execute(&state.pool)
         .await?;
 
-    // 3. Check if already completed
+    // 4. Check if already completed
     let already_done: Option<i64> = sqlx::query_scalar(
         "SELECT points_awarded FROM host_lesson_completions WHERE student_id = ? AND lesson_id = ?",
     )
@@ -392,7 +498,7 @@ pub async fn complete_lesson(
         }));
     }
 
-    // 4. Award points, update streak & badges
+    // 5. Award points, update streak & badges
     let points_awarded = if lesson.points_reward > 0 {
         lesson.points_reward
     } else {
@@ -462,12 +568,16 @@ pub async fn complete_lesson(
 
 pub async fn submit_quiz(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<SubmitQuizRequest>,
 ) -> AppResult<Json<SubmitQuizResponse>> {
-    // 1. Verify student exists
+    // 1. Verify student session token matches student_id
+    require_student_session(&state.pool, &headers, &req.student_id).await?;
+
+    // 2. Verify student exists
     let student = fetch_student_profile(&state.pool, &req.student_id).await?;
 
-    // 2. Verify pack & quiz exist on the Host Device
+    // 3. Verify pack & quiz exist on the Host Device
     let pack_row = sqlx::query("SELECT content_json FROM host_packs WHERE pack_id = ?")
         .bind(&req.pack_id)
         .fetch_optional(&state.pool)
@@ -501,7 +611,7 @@ pub async fn submit_quiz(
         .execute(&state.pool)
         .await?;
 
-    // 3. Grade quiz answers
+    // 4. Grade quiz answers
     let total_questions = quiz.questions.len();
     let mut correct_count = 0usize;
     let mut feedback = Vec::with_capacity(total_questions);
@@ -617,7 +727,7 @@ pub async fn submit_quiz(
 }
 
 // ============================================================================
-// Local Classroom Leaderboard (Offline Real-time)
+// Local Classroom & Cached National Leaderboards (100% Offline)
 // ============================================================================
 
 pub async fn get_local_leaderboard(
@@ -650,14 +760,65 @@ pub async fn get_local_leaderboard(
     Ok(Json(leaderboard))
 }
 
+/// Returns the cached National / State school leaderboard stored on the Host Device
+/// so students on the offline classroom hotspot can see how their school ranks across Nigeria!
+pub async fn get_host_national_leaderboard(
+    State(state): State<AppState>,
+    Query(filter): Query<LeaderboardFilter>,
+) -> AppResult<Json<Vec<CloudSchoolLeaderboardEntry>>> {
+    let limit = filter.limit.unwrap_or(50).clamp(1, 200);
+
+    let rows = if let Some(ref state_filter) = filter.state {
+        sqlx::query(
+            "SELECT school_id, school_name, state, lga, total_points, active_students_count, last_synced_at
+             FROM host_cached_school_leaderboard
+             WHERE LOWER(state) = LOWER(?)
+             ORDER BY total_points DESC, active_students_count DESC, school_name ASC
+             LIMIT ?",
+        )
+        .bind(state_filter)
+        .bind(limit)
+        .fetch_all(&state.pool)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT school_id, school_name, state, lga, total_points, active_students_count, last_synced_at
+             FROM host_cached_school_leaderboard
+             ORDER BY total_points DESC, active_students_count DESC, school_name ASC
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&state.pool)
+        .await?
+    };
+
+    let mut entries = Vec::with_capacity(rows.len());
+    for (idx, row) in rows.into_iter().enumerate() {
+        entries.push(CloudSchoolLeaderboardEntry {
+            rank: idx + 1,
+            school_id: row.try_get("school_id")?,
+            school_name: row.try_get("school_name")?,
+            state: row.try_get("state")?,
+            lga: row.try_get("lga")?,
+            total_points: row.try_get("total_points")?,
+            active_students_count: row.try_get("active_students_count")?,
+            last_synced_at: row.try_get("last_synced_at")?,
+        });
+    }
+
+    Ok(Json(entries))
+}
+
 // ============================================================================
-// Offline-to-Cloud Sync Operations
+// Offline-to-Cloud Sync Operations (Protected by Teacher PIN)
 // ============================================================================
 
 /// Generates an anonymized sync payload from local student scores without exposing PII.
 pub async fn export_sync_payload(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> AppResult<Json<SyncUploadPayload>> {
+    require_teacher_pin(&state.pool, &headers).await?;
     let payload = build_sync_upload_payload(&state.pool).await?;
     Ok(Json(payload))
 }
@@ -714,28 +875,44 @@ pub async fn build_sync_upload_payload(pool: &SqlitePool) -> AppResult<SyncUploa
     })
 }
 
-/// Pulls a content pack from the Cloud Catalog into the Host Device's local storage,
-/// automatically running LRU cache eviction if the device storage quota would be exceeded.
+/// Pulls a content pack from the remote Cloud Server (if `cloud_server_url` is configured)
+/// or the built-in Cloud Catalog into the Host Device's local storage, automatically
+/// running LRU cache eviction if the device storage quota would be exceeded.
 pub async fn pull_pack_from_cloud(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<PullPackRequest>,
 ) -> AppResult<Json<PullPackResponse>> {
-    let cloud_row = sqlx::query(
-        "SELECT pack_id, title, subject, grade_level, curriculum_standard, version, size_bytes, content_json
-         FROM cloud_packs WHERE pack_id = ?",
-    )
-    .bind(&req.pack_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or_else(|| {
-        AppError::NotFound(format!(
-            "Content pack '{}' not found in Cloud Catalog",
-            req.pack_id
-        ))
-    })?;
+    require_teacher_pin(&state.pool, &headers).await?;
 
-    let size_bytes: i64 = cloud_row.try_get("size_bytes")?;
     let config = fetch_school_config(&state.pool).await?;
+
+    let (pack, content_json, size_bytes) = if let Some(ref base_url) = config.cloud_server_url {
+        let url = format!(
+            "{}/api/cloud/packs/{}",
+            base_url.trim_end_matches('/'),
+            req.pack_id
+        );
+        let downloaded: ContentPack = http_client::get_json(&url).await?;
+        let serialized = serde_json::to_string(&downloaded)?;
+        let sz = serialized.len() as i64;
+        (downloaded, serialized, sz)
+    } else {
+        let cloud_row = sqlx::query("SELECT content_json, size_bytes FROM cloud_packs WHERE pack_id = ?")
+            .bind(&req.pack_id)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "Content pack '{}' not found in Cloud Catalog",
+                    req.pack_id
+                ))
+            })?;
+        let content_json: String = cloud_row.try_get("content_json")?;
+        let size_bytes: i64 = cloud_row.try_get("size_bytes")?;
+        let parsed: ContentPack = serde_json::from_str(&content_json)?;
+        (parsed, content_json, size_bytes)
+    };
 
     // Ensure LRU storage capacity before writing pack to Host Device
     let evicted_pack_ids = ensure_storage_capacity(
@@ -749,13 +926,6 @@ pub async fn pull_pack_from_cloud(
     let now = Utc::now().to_rfc3339();
     let pinned = req.pinned.unwrap_or(false);
     let pinned_int: i64 = if pinned { 1 } else { 0 };
-
-    let title: String = cloud_row.try_get("title")?;
-    let subject: String = cloud_row.try_get("subject")?;
-    let grade_level: String = cloud_row.try_get("grade_level")?;
-    let curriculum_standard: String = cloud_row.try_get("curriculum_standard")?;
-    let version: String = cloud_row.try_get("version")?;
-    let content_json: String = cloud_row.try_get("content_json")?;
 
     sqlx::query(
         "INSERT INTO host_packs (pack_id, title, subject, grade_level, curriculum_standard, version, size_bytes, pinned, downloaded_at, last_accessed_at, content_json)
@@ -772,12 +942,12 @@ pub async fn pull_pack_from_cloud(
             last_accessed_at = excluded.last_accessed_at,
             content_json = excluded.content_json",
     )
-    .bind(&req.pack_id)
-    .bind(&title)
-    .bind(&subject)
-    .bind(&grade_level)
-    .bind(&curriculum_standard)
-    .bind(&version)
+    .bind(&pack.pack_id)
+    .bind(&pack.title)
+    .bind(&pack.subject)
+    .bind(&pack.grade_level)
+    .bind(&pack.curriculum_standard)
+    .bind(&pack.version)
     .bind(size_bytes)
     .bind(pinned_int)
     .bind(&now)
@@ -790,12 +960,12 @@ pub async fn pull_pack_from_cloud(
 
     Ok(Json(PullPackResponse {
         downloaded_pack: HostPackSummary {
-            pack_id: req.pack_id,
-            title,
-            subject,
-            grade_level,
-            curriculum_standard,
-            version,
+            pack_id: pack.pack_id,
+            title: pack.title,
+            subject: pack.subject,
+            grade_level: pack.grade_level,
+            curriculum_standard: pack.curriculum_standard,
+            version: pack.version,
             size_bytes,
             pinned,
             downloaded_at: now.clone(),
@@ -807,18 +977,50 @@ pub async fn pull_pack_from_cloud(
     }))
 }
 
-/// Executes a full Host-to-Cloud synchronization:
+/// Executes a full Host-to-Cloud synchronization (requires `X-Teacher-Pin`):
 /// 1. Builds the anonymized student + school score payload.
-/// 2. Uploads it to the Cloud Sync engine.
-/// 3. Resets `unsynced_points = 0` on local student records and updates `last_synced_at`.
-/// 4. Returns updated national/state school ranks and available Cloud curriculum packs.
+/// 2. Uploads it over HTTP to `cloud_server_url` (if configured) or the built-in Cloud engine.
+/// 3. Caches the returned national school leaderboard snapshot locally on the Host Device for offline viewing.
+/// 4. Resets `unsynced_points = 0` on local student records and updates `last_synced_at`.
 pub async fn execute_cloud_sync(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> AppResult<Json<CloudSyncResult>> {
+    require_teacher_pin(&state.pool, &headers).await?;
+
+    let config = fetch_school_config(&state.pool).await?;
     let payload = build_sync_upload_payload(&state.pool).await?;
     let sync_time = payload.synced_at.clone();
 
-    let result = process_cloud_sync_payload(&state.pool, payload).await?;
+    let result: CloudSyncResult = if let Some(ref base_url) = config.cloud_server_url {
+        let url = format!("{}/api/cloud/sync", base_url.trim_end_matches('/'));
+        http_client::post_json(&url, &payload).await?
+    } else {
+        process_cloud_sync_payload(&state.pool, payload).await?
+    };
+
+    // Cache the updated national school leaderboard locally on the Host Device for offline classroom display
+    if !result.national_leaderboard.is_empty() {
+        sqlx::query("DELETE FROM host_cached_school_leaderboard")
+            .execute(&state.pool)
+            .await?;
+
+        for entry in &result.national_leaderboard {
+            sqlx::query(
+                "INSERT INTO host_cached_school_leaderboard (school_id, school_name, state, lga, total_points, active_students_count, last_synced_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&entry.school_id)
+            .bind(&entry.school_name)
+            .bind(&entry.state)
+            .bind(&entry.lga)
+            .bind(entry.total_points)
+            .bind(entry.active_students_count)
+            .bind(&entry.last_synced_at)
+            .execute(&state.pool)
+            .await?;
+        }
+    }
 
     sqlx::query("UPDATE host_students SET unsynced_points = 0")
         .execute(&state.pool)

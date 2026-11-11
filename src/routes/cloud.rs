@@ -213,6 +213,7 @@ pub async fn process_cloud_sync_payload(
     .await?;
 
     let available_packs = fetch_cloud_pack_summaries(pool).await?;
+    let national_leaderboard = query_cloud_school_leaderboard(pool, None, 50).await?;
 
     Ok(CloudSyncResult {
         school_id: payload.school_id,
@@ -221,17 +222,16 @@ pub async fn process_cloud_sync_payload(
         school_state_rank: (higher_state as usize) + 1,
         synced_students_count: payload.student_records.len(),
         available_packs,
+        national_leaderboard,
     })
 }
 
-/// Returns the national or state-level school leaderboard.
-pub async fn get_cloud_school_leaderboard(
-    State(state): State<AppState>,
-    Query(filter): Query<LeaderboardFilter>,
-) -> AppResult<Json<Vec<CloudSchoolLeaderboardEntry>>> {
-    let limit = filter.limit.unwrap_or(50).clamp(1, 200);
-
-    let rows = if let Some(ref state_filter) = filter.state {
+pub async fn query_cloud_school_leaderboard(
+    pool: &SqlitePool,
+    state_filter: Option<&str>,
+    limit: i64,
+) -> AppResult<Vec<CloudSchoolLeaderboardEntry>> {
+    let rows = if let Some(state_name) = state_filter {
         sqlx::query(
             "SELECT school_id, school_name, state, lga, total_points, active_students_count, last_synced_at
              FROM cloud_school_leaderboard
@@ -239,9 +239,9 @@ pub async fn get_cloud_school_leaderboard(
              ORDER BY total_points DESC, active_students_count DESC, school_name ASC
              LIMIT ?",
         )
-        .bind(state_filter)
+        .bind(state_name)
         .bind(limit)
-        .fetch_all(&state.pool)
+        .fetch_all(pool)
         .await?
     } else {
         sqlx::query(
@@ -251,7 +251,7 @@ pub async fn get_cloud_school_leaderboard(
              LIMIT ?",
         )
         .bind(limit)
-        .fetch_all(&state.pool)
+        .fetch_all(pool)
         .await?
     };
 
@@ -269,6 +269,17 @@ pub async fn get_cloud_school_leaderboard(
         });
     }
 
+    Ok(entries)
+}
+
+/// Returns the national or state-level school leaderboard.
+pub async fn get_cloud_school_leaderboard(
+    State(state): State<AppState>,
+    Query(filter): Query<LeaderboardFilter>,
+) -> AppResult<Json<Vec<CloudSchoolLeaderboardEntry>>> {
+    let limit = filter.limit.unwrap_or(50).clamp(1, 200);
+    let entries =
+        query_cloud_school_leaderboard(&state.pool, filter.state.as_deref(), limit).await?;
     Ok(Json(entries))
 }
 
